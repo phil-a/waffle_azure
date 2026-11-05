@@ -20,6 +20,9 @@ erl_crash.dump
 *.ez
 
 # Ignore package tarball (built via "mix hex.build").
-arc_azure-*.tar
+waffle_azure-*.tar
 
 .DS_STORE
+
+# Temporary files created by tests tagged with :tmp_dir.
+/tmp/
