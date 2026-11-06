@@ -36,7 +36,8 @@ defmodule WaffleAzure.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      extra_applications: [:logger, :crypto]
+      extra_applications: [:logger, :crypto],
+      mod: {Waffle.Storage.Azure.Application, []}
     ]
   end
 

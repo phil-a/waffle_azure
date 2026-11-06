@@ -9,6 +9,7 @@ defmodule Waffle.Storage.AzureTest do
   @key "test-secret-key"
   @block_size 4 * 1024 * 1024
   @host "https://testaccount.blob.core.windows.net"
+  @delegation_key_expiry "2030-01-01T00:00:00Z"
 
   defmodule Avatar do
     use Waffle.Definition
@@ -480,6 +481,311 @@ defmodule Waffle.Storage.AzureTest do
         Azure.url(Avatar, :thumb, {%{file_name: "a.png"}, "1"})
       end
     end
+  end
+
+  describe "with a managed identity" do
+    setup do
+      saved = Map.new([:credential, :access_key], &{&1, Application.fetch_env(:waffle_azure, &1)})
+
+      # Shows that no account key is needed.
+      Application.delete_env(:waffle_azure, :access_key)
+      Application.put_env(:waffle_azure, :credential, :managed_identity)
+
+      Azure.TokenCache.clear()
+
+      on_exit(fn ->
+        Enum.each(saved, fn
+          {key, {:ok, value}} -> Application.put_env(:waffle_azure, key, value)
+          {key, :error} -> Application.delete_env(:waffle_azure, key)
+        end)
+
+        System.delete_env("IDENTITY_ENDPOINT")
+        System.delete_env("IDENTITY_HEADER")
+        Azure.TokenCache.clear()
+      end)
+    end
+
+    test "authorizes requests with a token from the instance metadata service" do
+      stub_managed_identity()
+
+      assert {:ok, "a.png"} = Azure.put(Avatar, :original, {waffle_file(binary: "x"), "1"})
+
+      assert_received {:token_request, token_request}
+      assert token_request.host == "169.254.169.254"
+      assert token_request.request_path == "/metadata/identity/oauth2/token"
+      assert header(token_request, "metadata") == "true"
+
+      assert token_request.query_params == %{
+               "resource" => "https://storage.azure.com/",
+               "api-version" => "2018-02-01"
+             }
+
+      assert_received {:request, conn, "x"}
+      assert conn.request_path == "/uploads/avatars/1/a.png"
+      assert header(conn, "authorization") == "Bearer token-1"
+    end
+
+    test "uses the App Service endpoint when it is available" do
+      System.put_env("IDENTITY_ENDPOINT", "http://localhost:42356/msi/token")
+      System.put_env("IDENTITY_HEADER", "identity-header-secret")
+      stub_managed_identity()
+
+      assert {:ok, "a.png"} = Azure.put(Avatar, :original, {waffle_file(binary: "x"), "1"})
+
+      assert_received {:token_request, token_request}
+      assert token_request.request_path == "/msi/token"
+      assert header(token_request, "x-identity-header") == "identity-header-secret"
+      assert header(token_request, "metadata") == nil
+      assert token_request.query_params["api-version"] == "2019-08-01"
+      assert token_request.query_params["resource"] == "https://storage.azure.com/"
+    end
+
+    test "asks for a user-assigned identity by client ID" do
+      Application.put_env(:waffle_azure, :credential, {:managed_identity, client_id: "client-1"})
+      stub_managed_identity()
+
+      assert {:ok, "a.png"} = Azure.put(Avatar, :original, {waffle_file(binary: "x"), "1"})
+
+      assert_received {:token_request, token_request}
+      assert token_request.query_params["client_id"] == "client-1"
+    end
+
+    test "reuses a token until shortly before it expires" do
+      stub_managed_identity()
+
+      assert {:ok, _} = Azure.put(Avatar, :original, {waffle_file(binary: "x"), "1"})
+      assert {:ok, _} = Azure.put(Avatar, :original, {waffle_file(binary: "y"), "1"})
+
+      assert_received {:token_request, _}
+      refute_received {:token_request, _}
+
+      Azure.TokenCache.clear()
+      stub_managed_identity(token_expires_in: 60)
+
+      assert {:ok, _} = Azure.put(Avatar, :original, {waffle_file(binary: "x"), "1"})
+      assert {:ok, _} = Azure.put(Avatar, :original, {waffle_file(binary: "y"), "1"})
+
+      assert_received {:token_request, _}
+      assert_received {:token_request, _}
+    end
+
+    test "returns an error, without the identity header, when there is no token" do
+      System.put_env("IDENTITY_ENDPOINT", "http://localhost:42356/msi/token")
+      System.put_env("IDENTITY_HEADER", "identity-header-secret")
+
+      stub_managed_identity(
+        token_status: 400,
+        token: %{"error" => "invalid_request", "error_description" => "Identity not found"}
+      )
+
+      assert {:error, %Azure.AuthError{message: message}} =
+               Azure.put(Avatar, :original, {waffle_file(binary: "x"), "1"})
+
+      assert message =~ "HTTP 400 invalid_request: Identity not found"
+      refute message =~ "identity-header-secret"
+      refute_received {:request, _conn, _body}
+
+      log =
+        capture_log(fn ->
+          assert Azure.delete(Avatar, :thumb, {%{file_name: "a.png"}, "1"}) == :ok
+        end)
+
+      assert log =~ "Identity not found"
+      refute log =~ "identity-header-secret"
+
+      # Failures aren't cached.
+      stub_managed_identity()
+      assert {:ok, "a.png"} = Azure.put(Avatar, :original, {waffle_file(binary: "x"), "1"})
+    end
+
+    test "signs URLs with a user delegation key" do
+      stub_managed_identity()
+
+      url = Azure.url(Avatar, :thumb, {%{file_name: "a.png"}, "1"}, signed: true, expires_in: 600)
+
+      assert_received {:key_request, key_request, body}
+      assert key_request.method == "POST"
+      assert key_request.request_path == "/"
+      assert key_request.query_params == %{"restype" => "service", "comp" => "userdelegationkey"}
+      assert header(key_request, "authorization") == "Bearer token-1"
+
+      [_, start] = Regex.run(~r{<Start>([^<]+)</Start>}, body)
+      [_, expiry] = Regex.run(~r{<Expiry>([^<]+)</Expiry>}, body)
+      assert_in_delta seconds_from_now(start), -300, 5
+      assert_in_delta seconds_from_now(expiry), 24 * 60 * 60, 5
+
+      uri = URI.parse(url)
+      assert "#{uri.scheme}://#{uri.host}#{uri.path}" == "#{@host}/uploads/avatars/1/thumb.png"
+
+      query = URI.decode_query(uri.query)
+      assert_in_delta seconds_from_now(query["se"]), 600, 5
+
+      assert Map.drop(query, ["se", "sig"]) == %{
+               "sv" => "2021-12-02",
+               "sr" => "b",
+               "sp" => "r",
+               "skoid" => "object-1",
+               "sktid" => "tenant-1",
+               "skt" => "2026-01-01T00:00:00Z",
+               "ske" => @delegation_key_expiry,
+               "sks" => "b",
+               "skv" => "2021-12-02"
+             }
+
+      string_to_sign =
+        Enum.join(
+          [
+            "r",
+            "",
+            query["se"],
+            "/blob/#{@account}/uploads/avatars/1/thumb.png",
+            "object-1",
+            "tenant-1",
+            "2026-01-01T00:00:00Z",
+            @delegation_key_expiry,
+            "b",
+            "2021-12-02",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "2021-12-02",
+            "b",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            ""
+          ],
+          "\n"
+        )
+
+      expected =
+        :hmac |> :crypto.mac(:sha256, "delegation-key", string_to_sign) |> Base.encode64()
+
+      assert query["sig"] == expected
+
+      # The key and token are reused for later URLs.
+      assert Azure.url(Avatar, :original, {%{file_name: "a.png"}, "1"}, signed: true) =~ "&sig="
+      refute_received {:key_request, _conn, _body}
+      assert_received {:token_request, _}
+      refute_received {:token_request, _}
+    end
+
+    test "limits signed URLs to the lifetime of a user delegation key" do
+      stub_managed_identity()
+
+      assert_raise ArgumentError, ~r/at most 601200 seconds/, fn ->
+        Azure.url(Avatar, :thumb, {%{file_name: "a.png"}, "1"},
+          signed: true,
+          expires_in: 7 * 24 * 60 * 60
+        )
+      end
+    end
+
+    test "raises when it can't get a user delegation key" do
+      stub_managed_identity(key_status: 403)
+
+      assert_raise Azure.AuthError, ~r/HTTP 403 AuthorizationPermissionMismatch/, fn ->
+        Azure.url(Avatar, :thumb, {%{file_name: "a.png"}, "1"}, signed: true)
+      end
+    end
+
+    test "builds unsigned URLs without a token" do
+      stub_managed_identity()
+
+      assert Azure.url(Avatar, :thumb, {%{file_name: "a.png"}, "1"}) ==
+               "#{@host}/uploads/avatars/1/thumb.png"
+
+      refute_received {:token_request, _}
+    end
+
+    test "rejects an unknown credential or option" do
+      Application.put_env(:waffle_azure, :credential, :password)
+
+      assert_raise ArgumentError, ~r/invalid :credential :password/, fn ->
+        Azure.put(Avatar, :original, {waffle_file(binary: "x"), "1"})
+      end
+
+      Application.put_env(:waffle_azure, :credential, {:managed_identity, object_id: "1"})
+
+      assert_raise ArgumentError, ~r/unknown :managed_identity options \[:object_id\]/, fn ->
+        Azure.put(Avatar, :original, {waffle_file(binary: "x"), "1"})
+      end
+    end
+  end
+
+  # Answers token and user delegation key requests as Azure would, and records
+  # every request for the test to inspect.
+  defp stub_managed_identity(options \\ []) do
+    test = self()
+    expires_on = System.os_time(:second) + Keyword.get(options, :token_expires_in, 3600)
+
+    token =
+      Keyword.get(options, :token, %{
+        "access_token" => "token-1",
+        "expires_on" => Integer.to_string(expires_on),
+        "token_type" => "Bearer"
+      })
+
+    Req.Test.stub(Azure.Client, fn conn ->
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      conn = %{conn | query_params: URI.decode_query(conn.query_string)}
+
+      cond do
+        conn.host in ["169.254.169.254", "localhost"] ->
+          send(test, {:token_request, conn})
+
+          conn
+          |> Plug.Conn.put_status(Keyword.get(options, :token_status, 200))
+          |> Req.Test.json(token)
+
+        conn.query_params["comp"] == "userdelegationkey" ->
+          send(test, {:key_request, conn, body})
+
+          case Keyword.get(options, :key_status, 200) do
+            200 ->
+              conn
+              |> Plug.Conn.put_resp_content_type("application/xml")
+              |> Plug.Conn.send_resp(200, delegation_key_xml())
+
+            status ->
+              conn
+              |> Plug.Conn.put_resp_header("x-ms-error-code", "AuthorizationPermissionMismatch")
+              |> Plug.Conn.send_resp(status, "")
+          end
+
+        true ->
+          send(test, {:request, conn, body})
+          Plug.Conn.send_resp(conn, 201, "")
+      end
+    end)
+
+    # Tokens and keys are fetched by the cache's process.
+    Req.Test.allow(Azure.Client, test, Process.whereis(Azure.TokenCache))
+  end
+
+  defp delegation_key_xml do
+    """
+    <?xml version="1.0" encoding="utf-8"?>
+    <UserDelegationKey>
+      <SignedOid>object-1</SignedOid>
+      <SignedTid>tenant-1</SignedTid>
+      <SignedStart>2026-01-01T00:00:00Z</SignedStart>
+      <SignedExpiry>#{@delegation_key_expiry}</SignedExpiry>
+      <SignedService>b</SignedService>
+      <SignedVersion>2021-12-02</SignedVersion>
+      <Value>#{Base.encode64("delegation-key")}</Value>
+    </UserDelegationKey>
+    """
+  end
+
+  defp seconds_from_now(iso8601) do
+    {:ok, datetime, 0} = DateTime.from_iso8601(iso8601)
+    DateTime.diff(datetime, DateTime.utc_now())
   end
 
   defp sign(string_to_sign) do

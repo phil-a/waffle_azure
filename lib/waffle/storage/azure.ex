@@ -13,6 +13,35 @@ defmodule Waffle.Storage.Azure do
   `:account` and `:access_key` fall back to the `AZURE_ACCOUNT` and
   `AZURE_ACCESS_KEY` environment variables when they are not configured.
 
+  ## Managed identity
+
+  On Azure, the adapter can authenticate with the app's managed identity through
+  Microsoft Entra ID, instead of an access key:
+
+      config :waffle_azure,
+        account: "myaccount",
+        credential: :managed_identity
+
+  That uses the system-assigned identity. For a user-assigned identity, pass its
+  client ID:
+
+      config :waffle_azure,
+        account: "myaccount",
+        credential: {:managed_identity, client_id: "00000000-0000-0000-0000-000000000000"}
+
+  It works on App Service, Azure Functions and Container Apps, and on hosts with
+  the Instance Metadata Service, such as VMs and AKS nodes. The identity needs
+  the Storage Blob Data Contributor role on the storage account or container.
+
+  Tokens are cached until shortly before they expire. If one can't be fetched,
+  `put/3` returns `{:error, %Waffle.Storage.Azure.AuthError{}}`.
+
+  Signed URLs become user delegation SAS URLs, which are signed with a key the
+  identity requests from Azure. They can be valid for up to 7 days, less an hour.
+  If the key can't be fetched, `url/4` raises `Waffle.Storage.Azure.AuthError`.
+
+  `:credential` defaults to `:shared_key`, which uses `:access_key`.
+
   ## Containers
 
   Waffle's `:bucket` is the name of the Azure container, which must already
@@ -119,6 +148,9 @@ defmodule Waffle.Storage.Azure do
 
   Pass `signed: true` for a read-only URL that also works on a private container,
   and `:expires_in` to set how many seconds it stays valid.
+
+  With a managed identity, signing needs a user delegation key from Azure, so it
+  raises `Waffle.Storage.Azure.AuthError` if the key can't be fetched.
   """
   @impl true
   def url(definition, version, file_and_scope, options \\ []) do

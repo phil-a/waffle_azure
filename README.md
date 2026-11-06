@@ -46,6 +46,45 @@ config :waffle_azure,
 
 See the `Waffle.Storage.Azure` docs for the other options, including per-uploader containers, CDNs, and blob properties such as the content type.
 
+### Managed identity
+
+When your app runs on Azure, it can use its [managed identity](https://learn.microsoft.com/entra/identity/managed-identities-azure-resources/overview) instead of an access key. This works on App Service, Azure Functions and Container Apps, and on hosts with the Instance Metadata Service, such as VMs and AKS nodes.
+
+1. Turn on a managed identity for the app, then give it the Storage Blob Data Contributor role on the storage account:
+
+   ```sh
+   az role assignment create \
+     --assignee <the-identity's-principal-id> \
+     --role "Storage Blob Data Contributor" \
+     --scope "$(az storage account show --name <account> --query id --output tsv)"
+   ```
+
+   New role assignments can take a few minutes to apply.
+
+2. Configure the adapter to use it:
+
+   ```elixir
+   config :waffle_azure,
+     account: "your-azure-account",
+     credential: :managed_identity
+   ```
+
+   For a user-assigned identity, give its client ID instead: `credential: {:managed_identity, client_id: "..."}`.
+
+With a managed identity:
+
+* No access key is needed, so you can [turn off Shared Key access](https://learn.microsoft.com/azure/storage/common/shared-key-authorization-prevent) on the storage account.
+* Signed URLs are user delegation SAS URLs. They can be valid for up to 7 days, less an hour.
+* Managed identities only exist on Azure, so keep using an access key or [Azurite](https://github.com/Azure/Azurite) in development. Azure Arc-enabled servers aren't supported yet.
+
+### Planned
+
+These ways to authenticate with Microsoft Entra ID aren't supported yet, but are planned:
+
+* **AKS workload identity**, which exchanges the pod's Kubernetes service account token for an Entra token.
+* **Service principal with a client secret**, for apps that run outside Azure.
+* **A custom token function**, given as `{module, function, args}`, for any other way of getting a token.
+
 ## Usage
 
 Uploaders work as they do with any other Waffle storage:
